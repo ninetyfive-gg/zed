@@ -4929,6 +4929,7 @@ dependencies = [
  "indoc",
  "language",
  "lsp",
+ "ninetyfive",
  "paths",
  "project",
  "regex",
@@ -10466,6 +10467,21 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "ninetyfive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-tungstenite",
+ "client",
+ "edit_prediction",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "settings",
+]
 
 [[package]]
 name = "nix"
@@ -20452,6 +20468,7 @@ dependencies = [
  "migrator",
  "mimalloc",
  "nc",
+ "ninetyfive",
  "nix 0.29.0",
  "node_runtime",
  "notifications",
