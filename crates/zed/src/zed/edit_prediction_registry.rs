@@ -232,7 +232,7 @@ fn assign_edit_prediction_provider(
         }
         EditPredictionProvider::NinetyFive => {
             if let Some(ninetyfive) = NinetyFive::global(cx) {
-                let provider = cx.new(|_| NinetyFiveCompletionProvider::new(ninetyfive));
+                let provider = cx.new(|cx| NinetyFiveCompletionProvider::new(ninetyfive, cx));
                 editor.set_edit_prediction_provider(Some(provider), window, cx);
             }
         }

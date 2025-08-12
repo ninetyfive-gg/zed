@@ -10476,11 +10476,17 @@ dependencies = [
  "async-tungstenite",
  "client",
  "edit_prediction",
+ "futures 0.3.31",
  "gpui",
+ "gpui_tokio",
+ "http_client_tls",
  "language",
  "log",
  "project",
+ "serde_json",
  "settings",
+ "tokio",
+ "url",
 ]
 
 [[package]]
