@@ -1,24 +1,27 @@
 use crate::NinetyFive;
 use anyhow::Result;
 use async_tungstenite::{
-    tokio::client_async_tls_with_connector_and_config,
-    tungstenite::{protocol::WebSocketConfig, Message},
-    WebSocketStream,
+    tokio::client_async_tls_with_connector_and_config, tungstenite::Message, WebSocketStream,
 };
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
-use futures::{SinkExt, StreamExt};
-use gpui::{App, Context, Entity, Task};
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
+use gpui::{App, Context, Entity};
 use gpui_tokio::Tokio;
 use http_client_tls;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, ToOffset};
 use project::Project;
 use serde_json;
 use std::{
-    collections::HashMap,
     ops::Range,
     sync::{Arc, OnceLock},
 };
-use tokio::{net::TcpStream, sync::Mutex};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, Mutex},
+};
 
 const NINETYFIVE_API_URL: &str = "wss://api.ninetyfive.gg";
 
@@ -44,17 +47,34 @@ pub struct NinetyFiveCompletionProvider {
 
 static WEBSOCKET_CLIENT: OnceLock<Arc<WebSocketClient>> = OnceLock::new();
 
+#[derive(Debug)]
+enum WebSocketMessage {
+    FileContent {
+        path: String,
+        content: String,
+    },
+    CompletionRequest {
+        pos: usize,
+        repo: String,
+        request_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct WebSocketClient {
     api_url: String,
-    connection: Arc<Mutex<Option<WebSocketConnection>>>,
+    message_sender: Arc<Mutex<Option<mpsc::UnboundedSender<WebSocketMessage>>>>,
+    current_request_id: Arc<Mutex<Option<String>>>,
+    current_completion_text: Arc<Mutex<String>>,
 }
 
 impl WebSocketClient {
     fn new(api_url: String) -> Self {
         Self {
             api_url,
-            connection: Arc::new(Mutex::new(None)),
+            message_sender: Arc::new(Mutex::new(None)),
+            current_request_id: Arc::new(Mutex::new(None)),
+            current_completion_text: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -63,15 +83,10 @@ impl WebSocketClient {
             .get_or_init(|| {
                 let client = Arc::new(Self::new(NINETYFIVE_API_URL.to_string()));
 
-                // Initialize connection in background
+                // Start the connection manager immediately
                 let client_clone = client.clone();
                 let task = Tokio::spawn(cx, async move {
-                    if let Err(e) = client_clone.ensure_connection().await {
-                        log::error!(
-                            "NinetyFive: Failed to establish initial singleton connection: {}",
-                            e
-                        );
-                    }
+                    client_clone.start_connection_manager().await;
                 });
                 task.detach();
 
@@ -116,69 +131,146 @@ impl WebSocketClient {
         Ok(ws_stream)
     }
 
-    async fn ensure_connection(&self) -> Result<()> {
-        let mut connection_guard = self.connection.lock().await;
-
-        if connection_guard.is_none() {
+    async fn start_connection_manager(&self) {
+        loop {
             match self.create_connection().await {
-                Ok(conn) => {
-                    *connection_guard = Some(conn);
-                    log::debug!("NinetyFive: Connection established and stored");
+                Ok(connection) => {
+                    log::info!("NinetyFive: Connection established, starting manager");
+
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+
+                    // Store the sender
+                    {
+                        let mut sender_guard = self.message_sender.lock().await;
+                        *sender_guard = Some(tx);
+                    }
+
+                    let (mut sink, mut stream) = connection.split();
+                    let current_request_id = self.current_request_id.clone();
+                    let current_completion_text = self.current_completion_text.clone();
+
+                    // Spawn message sender task
+                    let sender_task = tokio::spawn(async move {
+                        while let Some(msg) = rx.recv().await {
+                            let json_msg = match msg {
+                                WebSocketMessage::FileContent { path, content } => {
+                                    serde_json::json!({
+                                        "type": "file-content",
+                                        "path": path,
+                                        "text": content
+                                    })
+                                }
+                                WebSocketMessage::CompletionRequest {
+                                    pos,
+                                    repo,
+                                    request_id,
+                                } => {
+                                    serde_json::json!({
+                                        "type": "delta-completion-request",
+                                        "requestId": request_id,
+                                        "repo": repo,
+                                        "pos": pos
+                                    })
+                                }
+                            };
+
+                            if let Err(e) =
+                                sink.send(Message::Text(json_msg.to_string().into())).await
+                            {
+                                log::error!("NinetyFive: Failed to send message: {}", e);
+                                break;
+                            }
+                        }
+                    });
+
+                    // Spawn message receiver task
+                    let receiver_task = tokio::spawn(async move {
+                        while let Some(msg) = stream.next().await {
+                            match msg {
+                                Ok(Message::Text(text)) => {
+                                    log::info!("NinetyFive: Received: {}", text);
+
+                                    if let Ok(response) =
+                                        serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        if let Some(response_id) =
+                                            response.get("r").and_then(|r| r.as_str())
+                                        {
+                                            // Check if this is for the current request (non-blocking)
+                                            if let Ok(current_id_guard) =
+                                                current_request_id.try_lock()
+                                            {
+                                                if let Some(ref current_id) = *current_id_guard {
+                                                    if response_id == current_id {
+                                                        if let Some(value) = response
+                                                            .get("v")
+                                                            .and_then(|v| v.as_str())
+                                                        {
+                                                            // Append to current completion (non-blocking)
+                                                            if let Ok(mut completion_guard) =
+                                                                current_completion_text.try_lock()
+                                                            {
+                                                                completion_guard.push_str(value);
+                                                                log::info!(
+                                                                    "NinetyFive: Updated completion: '{}'",
+                                                                    *completion_guard
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Message::Close(_)) => {
+                                    log::info!("NinetyFive: Connection closed");
+                                    break;
+                                }
+                                Err(e) => {
+                                    log::error!("NinetyFive: Connection error: {}", e);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+
+                    // Wait for either task to complete (indicating connection loss)
+                    tokio::select! {
+                        _ = sender_task => {
+                            log::warn!("NinetyFive: Sender task ended");
+                        }
+                        _ = receiver_task => {
+                            log::warn!("NinetyFive: Receiver task ended");
+                        }
+                    }
+
+                    // Clear the sender
+                    {
+                        let mut sender_guard = self.message_sender.lock().await;
+                        *sender_guard = None;
+                    }
                 }
                 Err(e) => {
                     log::error!("NinetyFive: Failed to create connection: {}", e);
-                    return Err(e);
                 }
             }
-        }
 
-        Ok(())
-    }
-
-    async fn reconnect_if_needed(&self) -> Result<()> {
-        let mut connection_guard = self.connection.lock().await;
-
-        // Always try to create a new connection
-        match self.create_connection().await {
-            Ok(conn) => {
-                *connection_guard = Some(conn);
-                log::debug!("NinetyFive: Reconnected successfully");
-                Ok(())
-            }
-            Err(e) => {
-                *connection_guard = None;
-                log::error!("NinetyFive: Reconnection failed: {}", e);
-                Err(e)
-            }
+            // Wait before reconnecting
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
 
     pub async fn send_file_content(&self, path: &str, content: &str) -> Result<()> {
-        self.ensure_connection().await?;
-
-        let message = serde_json::json!({
-            "type": "file-content",
-            "path": path,
-            "text": content
-        });
-
-        let mut connection_guard = self.connection.lock().await;
-        if let Some(ref mut ws_stream) = connection_guard.as_mut() {
-            match ws_stream
-                .send(Message::Text(message.to_string().into()))
-                .await
-            {
-                Ok(_) => {
-                    log::debug!("NinetyFive: Sent file content for {}", path);
-                    Ok(())
-                }
-                Err(e) => {
-                    log::error!("NinetyFive: Failed to send file content: {}", e);
-                    // Drop the connection so it gets recreated next time
-                    *connection_guard = None;
-                    Err(e.into())
-                }
-            }
+        let sender_guard = self.message_sender.lock().await;
+        if let Some(ref sender) = *sender_guard {
+            sender.send(WebSocketMessage::FileContent {
+                path: path.to_string(),
+                content: content.to_string(),
+            })?;
+            log::debug!("NinetyFive: Queued file content for {}", path);
+            Ok(())
         } else {
             Err(anyhow::anyhow!("No websocket connection available"))
         }
@@ -188,118 +280,52 @@ impl WebSocketClient {
         &self,
         pos: usize,
         repo: &str,
-        file_path: Option<&str>,
+        _file_path: Option<&str>,
         file_content: Option<&str>,
-    ) -> Result<String> {
-        self.ensure_connection().await?;
-
+    ) -> Result<()> {
         // Always send file content before completion request if provided
-        if let (Some(content)) = (file_content) {
-            if let Err(e) = self.send_file_content("Untitled-1", content).await {
-                log::warn!(
-                    "NinetyFive: Failed to send file content before completion request: {}",
-                    e
-                );
-                // Continue with completion request even if file content fails
-                return Err(e);
-            }
+        if let Some(content) = file_content {
+            self.send_file_content("Untitled-1", content).await?;
         } else {
-            log::debug("NinetyFive: didnt send content");
-            return Ok("".to_string());
+            log::info!("NinetyFive: No file content to send");
+            return Ok(());
         }
 
         let request_id = generate_request_id();
-        let message = serde_json::json!({
-            "type": "delta-completion-request",
-            "requestId": request_id,
-            "repo": repo,
-            "pos": pos
-        });
 
-        let mut connection_guard = self.connection.lock().await;
-        if let Some(ref mut ws_stream) = connection_guard.as_mut() {
-            // Send the request
-            match ws_stream
-                .send(Message::Text(message.to_string().into()))
-                .await
-            {
-                Ok(_) => {
-                    log::debug!(
-                        "NinetyFive: Sent delta completion request {} at pos {}",
-                        request_id,
-                        pos
-                    );
-                }
-                Err(e) => {
-                    log::error!("NinetyFive: Failed to send completion request: {}", e);
-                    *connection_guard = None;
-                    return Err(e.into());
-                }
-            }
+        // Clear current completion and set new request ID (non-blocking)
+        // This ensures we don't show stale completions from previous requests
+        if let Ok(mut current_id_guard) = self.current_request_id.try_lock() {
+            *current_id_guard = Some(request_id.clone());
+        }
+        if let Ok(mut completion_guard) = self.current_completion_text.try_lock() {
+            completion_guard.clear();
+        }
 
-            // Wait for response with timeout
-            let timeout_duration = std::time::Duration::from_secs(10);
-            let timeout_future = tokio::time::sleep(timeout_duration);
-            tokio::pin!(timeout_future);
+        let sender_guard = self.message_sender.lock().await;
+        if let Some(ref sender) = *sender_guard {
+            sender.send(WebSocketMessage::CompletionRequest {
+                pos,
+                repo: repo.to_string(),
+                request_id: request_id.clone(),
+            })?;
 
-            let mut completion = String::new();
-
-            loop {
-                tokio::select! {
-                    msg_result = ws_stream.next() => {
-                        match msg_result {
-                            Some(Ok(Message::Text(text))) => {
-                                log::debug!("NinetyFive: Received websocket message: {}", text);
-
-                                if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if let Some(response_id) = response.get("r").and_then(|r| r.as_str()) {
-                                        if response_id == request_id {
-                                            if let Some(value) = response.get("v").and_then(|v| v.as_str()) {
-                                                completion.push_str(value);
-
-                                                // Check if this is the final response
-                                                if response.get("flush").and_then(|f| f.as_bool()).unwrap_or(true) {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(Message::Close(close_frame))) => {
-                                log::info!("NinetyFive: Websocket connection closed by server: {:?}", close_frame);
-                                *connection_guard = None;
-                                return Err(anyhow::anyhow!("Connection closed by server"));
-                            }
-                            Some(Err(e)) => {
-                                log::error!("NinetyFive: Websocket error: {}", e);
-                                *connection_guard = None;
-                                return Err(e.into());
-                            }
-                            None => {
-                                log::debug!("NinetyFive: Websocket stream ended");
-                                *connection_guard = None;
-                                return Err(anyhow::anyhow!("Connection ended"));
-                            }
-                            _ => {
-                                log::debug!("NinetyFive: Received non-text websocket message");
-                            }
-                        }
-                    }
-                    _ = &mut timeout_future => {
-                        log::warn!("NinetyFive: Completion request {} timed out", request_id);
-                        return Err(anyhow::anyhow!("Request timed out"));
-                    }
-                }
-            }
-
-            if completion.is_empty() {
-                Ok("hello_ninetyfive_no_response".to_string())
-            } else {
-                Ok(completion)
-            }
+            log::info!(
+                "NinetyFive: Queued completion request {} at pos {}",
+                request_id,
+                pos
+            );
+            Ok(())
         } else {
             Err(anyhow::anyhow!("No websocket connection available"))
+        }
+    }
+
+    pub async fn get_current_completion(&self) -> String {
+        if let Ok(completion_guard) = self.current_completion_text.try_lock() {
+            completion_guard.clone()
+        } else {
+            String::new()
         }
     }
 }
@@ -323,52 +349,6 @@ impl NinetyFiveCompletionProvider {
         Self {
             ninetyfive,
             current_completion: None,
-        }
-    }
-
-    fn send_file_content_if_needed(&self, buffer: &Entity<Buffer>, cx: &App) {
-        let client = WebSocketClient::get_singleton(cx);
-        let buffer_snapshot = buffer.read(cx);
-        if let Some(file) = buffer_snapshot.file() {
-            let path = file.path().to_string_lossy().to_string();
-            let content = buffer_snapshot.text();
-
-            let task = Tokio::spawn(cx, async move {
-                if let Err(e) = client.send_file_content(&path, &content).await {
-                    log::error!("NinetyFive: Failed to send file content: {}", e);
-                }
-            });
-
-            task.detach();
-        }
-    }
-
-    async fn fetch_completion(
-        &self,
-        pos: usize,
-        repo: &str,
-        file_path: Option<&str>,
-        file_content: Option<&str>,
-        cx: &App,
-    ) -> Result<String> {
-        log::debug!("NinetyFive: Requesting completion at pos {}", pos);
-
-        let client = WebSocketClient::get_singleton(cx);
-        match client
-            .send_delta_completion_request(pos, repo, file_path, file_content)
-            .await
-        {
-            Ok(completion) => {
-                log::debug!(
-                    "NinetyFive: Received completion from websocket: '{}'",
-                    completion
-                );
-                Ok(completion)
-            }
-            Err(err) => {
-                log::error!("NinetyFive: Websocket request failed: {}", err);
-                Ok("hello_ninetyfive_fallback".to_string())
-            }
         }
     }
 }
@@ -405,7 +385,7 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         debounce: bool,
         _cx: &mut Context<Self>,
     ) {
-        log::debug!("NinetyFive: Refresh called (debounce: {})", debounce);
+        log::info!("NinetyFive: Refresh called (debounce: {})", debounce);
         self.current_completion = None;
     }
 
@@ -435,7 +415,7 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         cursor_position: language::Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
-        log::debug!("NinetyFive: Suggest called");
+        log::info!("NinetyFive: Suggest called");
 
         // If we have a current completion, try to interpolate it
         if let Some(current_completion) = &self.current_completion {
@@ -476,10 +456,11 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
             (None, None)
         };
 
-        // Make async completion request using singleton connection
+        // Send completion request
         let client = WebSocketClient::get_singleton(cx);
+        let client_clone = client.clone();
         let task = Tokio::spawn(cx, async move {
-            match client
+            if let Err(e) = client_clone
                 .send_delta_completion_request(
                     cursor_offset,
                     &repo,
@@ -488,26 +469,27 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
                 )
                 .await
             {
-                Ok(completion) => {
-                    log::debug!(
-                        "NinetyFive: Received completion via singleton connection: '{}'",
-                        completion
-                    );
-                    // TODO: Update the current_completion and trigger re-render
-                }
-                Err(e) => {
-                    log::error!("NinetyFive: Completion request failed: {}", e);
-                }
+                log::error!("NinetyFive: Completion request failed: {}", e);
             }
         });
-
         task.detach();
 
-        // Return placeholder for now
+        // Check if we have any completion text from the shared state
+        let client_clone2 = client.clone();
+        let task2 = Tokio::spawn(cx, async move {
+            let completion_text = client_clone2.get_current_completion().await;
+            if !completion_text.is_empty() {
+                log::debug!("NinetyFive: Found completion text: '{}'", completion_text);
+                // TODO: Update the provider's current_completion and trigger re-render
+            }
+        });
+        task2.detach();
+
+        // Check current shared completion state
         let position = cursor_position.bias_right(&buffer_snapshot);
         Some(EditPrediction {
             id: None,
-            edits: vec![(position..position, "hello_ws_friend".to_string())],
+            edits: vec![(position..position, "hello_simple_friend".to_string())],
             edit_preview: None,
         })
     }
