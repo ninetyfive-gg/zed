@@ -32,6 +32,7 @@ struct CurrentCompletion {
     snapshot: BufferSnapshot,
     edits: Arc<[(Range<Anchor>, String)]>,
     edit_preview: EditPreview,
+    cursor_offset: usize,
 }
 
 impl CurrentCompletion {
@@ -66,6 +67,7 @@ pub struct WebSocketClient {
     message_sender: Arc<Mutex<Option<mpsc::UnboundedSender<WebSocketMessage>>>>,
     current_request_id: Arc<Mutex<Option<String>>>,
     current_completion_text: Arc<Mutex<String>>,
+    current_completion_offset: Arc<Mutex<Option<usize>>>,
 }
 
 impl WebSocketClient {
@@ -75,6 +77,7 @@ impl WebSocketClient {
             message_sender: Arc::new(Mutex::new(None)),
             current_request_id: Arc::new(Mutex::new(None)),
             current_completion_text: Arc::new(Mutex::new(String::new())),
+            current_completion_offset: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -301,6 +304,9 @@ impl WebSocketClient {
         if let Ok(mut completion_guard) = self.current_completion_text.try_lock() {
             completion_guard.clear();
         }
+        if let Ok(mut offset_guard) = self.current_completion_offset.try_lock() {
+            *offset_guard = Some(pos);
+        }
 
         let sender_guard = self.message_sender.lock().await;
         if let Some(ref sender) = *sender_guard {
@@ -417,24 +423,74 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
     ) -> Option<EditPrediction> {
         log::info!("NinetyFive: Suggest called");
 
-        // If we have a current completion, try to interpolate it
+        // Get current buffer snapshot
+        let buffer_snapshot = buffer.read(cx);
+        let snapshot = buffer_snapshot.snapshot();
+        let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+
+        // Check if we have a current completion and if it's still valid
         if let Some(current_completion) = &self.current_completion {
-            let buffer_snapshot = buffer.read(cx);
-            if let Some(edits) = current_completion.interpolate(&buffer_snapshot.snapshot()) {
-                if !edits.is_empty() {
-                    return Some(EditPrediction {
-                        id: None,
-                        edits,
-                        edit_preview: Some(current_completion.edit_preview.clone()),
-                    });
+            // Check if the completion is still valid for the current position and buffer state
+            if current_completion.snapshot.version() == snapshot.version() 
+                && current_completion.cursor_offset == cursor_offset {
+                if let Some(edits) = current_completion.interpolate(&snapshot) {
+                    if !edits.is_empty() {
+                        log::info!("NinetyFive: Reusing existing completion {} {}", current_completion.cursor_offset, cursor_offset);
+                        return Some(EditPrediction {
+                            id: None,
+                            edits,
+                            edit_preview: Some(current_completion.edit_preview.clone()),
+                        });
+                    }
                 }
+            } else {
+                // Buffer has changed or cursor moved, invalidate current completion
+                log::info!("NinetyFive: Buffer changed or cursor moved, invalidating current completion");
+                self.current_completion = None;
             }
         }
 
-        // Get cursor position in bytes
-        let buffer_snapshot = buffer.read(cx);
-        let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+        // Check if we have any completion text from the shared state
+        let client = WebSocketClient::get_singleton(cx);
+        let (completion_text, completion_offset) = if let (Ok(completion_guard), Ok(offset_guard)) = 
+            (client.current_completion_text.try_lock(), client.current_completion_offset.try_lock()) {
+            (completion_guard.clone(), *offset_guard)
+        } else {
+            (String::new(), None)
+        };
 
+        // If we have completion text and no current completion, check if it's for the current position
+        if !completion_text.is_empty() && self.current_completion.is_none() {
+            // Only use the completion if it's for the current cursor position
+            if completion_offset == Some(cursor_offset) {
+                log::info!("NinetyFive: Found completion text for current position: '{}'", completion_text);
+                
+                let position = cursor_position.bias_right(&buffer_snapshot);
+                let edits: Arc<[(Range<Anchor>, String)]> = Arc::from([(position..position, completion_text.clone())]);
+                
+                // Create edit preview using the buffer's preview_edits method
+                let edit_preview_task = buffer_snapshot.preview_edits(edits.clone(), cx);
+                let edit_preview = cx.background_executor().block(edit_preview_task);
+                
+                self.current_completion = Some(CurrentCompletion {
+                    snapshot: snapshot.clone(),
+                    edits: edits.clone(),
+                    edit_preview,
+                    cursor_offset,
+                });
+
+                return Some(EditPrediction {
+                    id: None,
+                    edits: vec![(position..position, completion_text)],
+                    edit_preview: None,
+                });
+            } else {
+                log::info!("NinetyFive: Ignoring completion text for different position: expected {}, got {:?}", cursor_offset, completion_offset);
+            }
+        }
+
+        log::info!("Ninetyfive: about to request a new one");
+        // If no current completion or completion text, send a new completion request
         // Get repo name (fallback to "unknown")
         let repo = buffer_snapshot
             .file()
@@ -457,7 +513,6 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         };
 
         // Send completion request
-        let client = WebSocketClient::get_singleton(cx);
         let client_clone = client.clone();
         let task = Tokio::spawn(cx, async move {
             if let Err(e) = client_clone
@@ -474,24 +529,8 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         });
         task.detach();
 
-        // Check if we have any completion text from the shared state
-        let client_clone2 = client.clone();
-        let task2 = Tokio::spawn(cx, async move {
-            let completion_text = client_clone2.get_current_completion().await;
-            if !completion_text.is_empty() {
-                log::debug!("NinetyFive: Found completion text: '{}'", completion_text);
-                // TODO: Update the provider's current_completion and trigger re-render
-            }
-        });
-        task2.detach();
-
-        // Check current shared completion state
-        let position = cursor_position.bias_right(&buffer_snapshot);
-        Some(EditPrediction {
-            id: None,
-            edits: vec![(position..position, "hello_simple_friend".to_string())],
-            edit_preview: None,
-        })
+        // No completion available yet
+        None
     }
 }
 
