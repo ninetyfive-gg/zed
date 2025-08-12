@@ -373,7 +373,7 @@ impl Render for EditPredictionButton {
 
                 let icon = match status {
                     NinetyFive::Error { .. } => IconName::AiMistral,
-                    NinetyFive::Ready { .. } => {
+                    NinetyFive::Connected { .. } => {
                         if enabled {
                             IconName::AiMistral
                         } else {
@@ -385,12 +385,13 @@ impl Render for EditPredictionButton {
 
                 let tooltip_text = match status {
                     NinetyFive::Starting => "NinetyFive is starting...",
-                    NinetyFive::Ready => "NinetyFive",
                     NinetyFive::Error { .. } => "NinetyFive error",
+                    NinetyFive::FailedConnection { .. } => "NinetyFive error",
+                    NinetyFive::Connected(ninety_five_agent) => todo!(),
                 };
 
                 let has_error = matches!(status, NinetyFive::Error { .. });
-                let is_ready = matches!(status, NinetyFive::Ready);
+                let is_ready = matches!(status, NinetyFive::Connected(_));
 
                 let fs = self.fs.clone();
                 let this = cx.entity().clone();
