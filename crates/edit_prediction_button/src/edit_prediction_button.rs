@@ -387,7 +387,7 @@ impl Render for EditPredictionButton {
                     NinetyFive::Starting => "NinetyFive is starting...",
                     NinetyFive::Error { .. } => "NinetyFive error",
                     NinetyFive::FailedConnection { .. } => "NinetyFive error",
-                    NinetyFive::Connected(ninety_five_agent) => todo!(),
+                    NinetyFive::Connected(ninety_five_agent) => "NinetyFive!",
                 };
 
                 let has_error = matches!(status, NinetyFive::Error { .. });
