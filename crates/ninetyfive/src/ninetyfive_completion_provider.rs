@@ -3,7 +3,7 @@ use anyhow::Result;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::StreamExt as _;
 use gpui::{App, Context, Entity, EntityId, Task};
-use language::{Anchor, Buffer, BufferSnapshot, EditPreview, TextDimension};
+use language::{Anchor, Buffer, BufferSnapshot};
 use project::Project;
 use std::{
     ops::{AddAssign, Range},

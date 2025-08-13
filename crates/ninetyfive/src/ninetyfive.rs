@@ -1,6 +1,5 @@
 mod ninetyfive_completion_provider;
 
-use gpui_tokio::Tokio;
 pub use ninetyfive_completion_provider::*;
 
 use anyhow::{Context as _, Result};
@@ -9,7 +8,7 @@ use client::Client;
 use collections::BTreeMap;
 use futures::{SinkExt, StreamExt, channel::mpsc};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, EntityId, Global, Task, WeakEntity, actions,
+    App, AppContext, Context, Entity, EntityId, Global, Task, WeakEntity, actions,
 };
 use http_client::Request;
 use language::{Anchor, Buffer, ToOffset, language_settings::all_language_settings};
@@ -103,9 +102,11 @@ impl NinetyFive {
             cx.spawn(async move |this, cx| {
                 let ws_url = "wss://api.ninetyfive.gg";
 
-                this.update(cx, |this, cx| {
+                let agent = NinetyFiveAgent::new(ws_url, client.clone(), this.clone()).await?;
+
+                this.update(cx, |this, _cx| {
                     if let Self::Starting = this {
-                        *this = Self::Connected(NinetyFiveAgent::new(ws_url, client.clone(), cx)?);
+                        *this = Self::Connected(agent);
                     }
                     anyhow::Ok(())
                 })
@@ -197,7 +198,7 @@ impl NinetyFive {
         cursor_position: Anchor,
         cx: &App,
     ) -> Option<&str> {
-        if let Self::Connected(agent) = self {
+        if let Self::Connected(_agent) = self {
             // wed find the completion here
             None
         } else {
@@ -229,49 +230,27 @@ pub struct NinetyFiveAgent {
 }
 
 impl NinetyFiveAgent {
-    fn new(ws_url: &str, client: Arc<Client>, cx: &mut Context<NinetyFive>) -> Result<Self> {
-        let mut req: Request<()> = ws_url.into_client_request()?;
+    async fn new(ws_url: &str, client: Arc<Client>, this: WeakEntity<NinetyFive>) -> Result<Self> {
+        let req: Request<()> = ws_url.into_client_request()?;
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
-        let (close_tx, close_rx) = mpsc::unbounded();
+        let (close_tx, _close_rx) = mpsc::unbounded();
 
-        let handle_connection = cx.spawn({
-            let client = client.clone();
-            let outgoing_tx = outgoing_tx.clone();
-            async move |this, cx| {
-                let (ws_stream, _) = connect_async(req)
-                    .await
-                    .context("Failed to connect to NinetyFive server")?;
+        // Connect to WebSocket
+        let (ws_stream, _) = connect_async(req)
+            .await
+            .context("Failed to connect to NinetyFive server")?;
 
-                let (mut ws_sink, mut ws_stream) = ws_stream.split();
+        let (ws_sink, ws_stream) = ws_stream.split();
 
-                let mut status = client.status();
-                while let Some(status) = status.next().await {
-                    if status.is_connected() {
-                        // this.update(cx, |this, cx| {
-                        //     // TODO here we'd change account status
-                        // })?;
-                        break;
-                    }
-                }
-
-                let outgoing_future = Self::handle_outgoing_messages(outgoing_rx, ws_sink);
-                let incoming_future = Self::handle_incoming_messages(this, ws_stream, cx);
-
-                // This will run both concurrently and return when both complete
-                // (which should happen when the connection closes)
-                let (outgoing_result, incoming_result) =
-                    futures::future::join(outgoing_future, incoming_future).await;
-
-                // Return the first error if any, otherwise Ok
-                outgoing_result.and(incoming_result)
-            }
-        });
+        // Spawn tasks to handle the WebSocket connection
+        tokio::spawn(Self::handle_outgoing_messages(outgoing_rx, ws_sink));
+        tokio::spawn(Self::handle_incoming_messages(this, ws_stream));
 
         Ok(Self {
             next_state_id: NinetyFiveCompletionStateId::default(),
             states: BTreeMap::default(),
             outgoing_tx,
-            _handle_outgoing_messages: handle_connection,
+            _handle_outgoing_messages: Task::ready(Ok(())),
             _handle_incoming_messages: Task::ready(Ok(())),
             client,
             close_tx: Some(close_tx),
@@ -296,13 +275,12 @@ impl NinetyFiveAgent {
     }
 
     async fn handle_incoming_messages(
-        this: WeakEntity<NinetyFive>,
+        _this: WeakEntity<NinetyFive>,
         mut ws_stream: futures::stream::SplitStream<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
         >,
-        cx: &mut AsyncApp,
     ) -> Result<()> {
         while let Some(msg) = ws_stream.next().await {
             let msg = msg.context("WebSocket error")?;
@@ -314,13 +292,9 @@ impl NinetyFiveAgent {
 
                     match message {
                         Ok(message) => {
-                            this.update(cx, |this, _cx| {
-                                if let NinetyFive::Connected(this) = this {
-                                    this.handle_message(message);
-                                }
-                                Task::ready(anyhow::Ok(()))
-                            })?
-                            .await?;
+                            // For now, just log the message. We'll need to handle this differently
+                            // as we can't update GPUI entities from tokio tasks directly
+                            log::info!("Received message: {:?}", message);
                         }
                         Err(e) => {
                             log::warn!("Failed to deserialize message: {}", e);
