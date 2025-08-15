@@ -54,6 +54,7 @@ enum WebSocketMessage {
     FileContent { path: String, text: String },
     #[serde(rename = "delta-completion-request")]
     DeltaCompletionRequest {
+        #[serde(rename = "requestId")]
         request_id: String,
         repo: String,
         pos: usize,
@@ -134,6 +135,7 @@ impl NinetyFive {
         cx: &App,
     ) -> Option<NinetyFiveCompletion> {
         if let Self::Connected(agent) = self {
+            log::info!("is connected, about to call complete");
             let buffer_id = buffer.entity_id();
             let buffer = buffer.read(cx);
             let path = buffer
@@ -170,6 +172,7 @@ impl NinetyFive {
 
             let request_id = generate_request_id();
 
+            log::info!("about to send messages frens");
             let _ = agent
                 .outgoing_tx
                 .unbounded_send(WebSocketMessage::FileContent {
@@ -306,9 +309,9 @@ impl NinetyFiveAgent {
         mut outgoing: mpsc::UnboundedReceiver<WebSocketMessage>,
         mut ws_sink: impl SinkExt<Message, Error = async_tungstenite::tungstenite::Error> + Unpin,
     ) -> Result<()> {
-        log::info!("outgoing!!!");
         while let Some(message) = outgoing.next().await {
             let json = serde_json::to_string(&message)?;
+            log::info!("outgoing!!! {}", json);
             ws_sink.send(Message::text(json)).await?;
         }
         Ok(())

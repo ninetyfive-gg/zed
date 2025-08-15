@@ -124,6 +124,7 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
     ) {
         log::info!("NinetyFive: Refresh called (debounce: {})", debounce);
         let Some(mut completion) = self.ninetyfive.update(cx, |ninetyfive, cx| {
+            log::info!("about to call complete");
             ninetyfive.complete(&buffer_handle, cursor_position, cx)
         }) else {
             return;
