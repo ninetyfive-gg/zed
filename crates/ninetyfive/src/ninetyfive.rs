@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
 use std::{path::PathBuf, sync::Arc};
 
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+use url;
 
 actions!(ninetyfive, []);
 
@@ -60,9 +61,12 @@ enum WebSocketMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum NinetyFiveMessage {
     SubscriptionInfo {
+        #[serde(rename = "type")]
+        message_type: String,
+        #[serde(alias = "isPaid")]
         is_paid: bool,
         name: String,
     },
@@ -72,8 +76,7 @@ pub enum NinetyFiveMessage {
         end: Option<bool>,
         flush: Option<bool>,
     },
-    #[serde(other)]
-    Unknown,
+    Unknown(serde_json::Value), // Catches anything else
 }
 
 pub enum NinetyFive {
@@ -105,6 +108,7 @@ impl NinetyFive {
 
                 this.update(cx, |this, cx| {
                     if let Self::Starting = this {
+                        log::info!("!hesdf");
                         *this = Self::Connected(NinetyFiveAgent::new(ws_url, client.clone(), cx)?);
                     }
                     anyhow::Ok(())
@@ -222,38 +226,58 @@ pub struct NinetyFiveAgent {
     next_state_id: NinetyFiveCompletionStateId,
     states: BTreeMap<NinetyFiveCompletionStateId, NinetyFiveCompletionState>,
     outgoing_tx: mpsc::UnboundedSender<WebSocketMessage>,
-    _handle_outgoing_messages: Task<Result<()>>,
-    _handle_incoming_messages: Task<Result<()>>,
+    _connection_task: Task<Result<()>>,
     client: Arc<Client>,
     close_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl NinetyFiveAgent {
     fn new(ws_url: &str, client: Arc<Client>, cx: &mut Context<NinetyFive>) -> Result<Self> {
-        let mut req: Request<()> = ws_url.into_client_request()?;
+        let req: Request<()> = ws_url.into_client_request()?;
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
-        let (close_tx, close_rx) = mpsc::unbounded();
+        let (close_tx, _close_rx) = mpsc::unbounded();
+        let ws_url = ws_url.to_string(); // Convert to owned string
 
         let handle_connection = cx.spawn({
             let client = client.clone();
-            let outgoing_tx = outgoing_tx.clone();
+            log::info!("About to connect");
             async move |this, cx| {
-                let (ws_stream, _) = connect_async(req)
-                    .await
-                    .context("Failed to connect to NinetyFive server")?;
+                log::info!("Starting WebSocket connection to NinetyFive server");
+                let (ws_stream, _) = Tokio::spawn(cx, async move {
+                    log::info!("Attempting to connect to WebSocket");
 
-                let (mut ws_sink, mut ws_stream) = ws_stream.split();
+                    // Parse the URL to get host and port
+                    let url = url::Url::parse(&ws_url).context("Invalid WebSocket URL")?;
+                    let host = url.host_str().context("Missing host in URL")?;
+                    let port = url.port_or_known_default().context("Missing port in URL")?;
 
-                let mut status = client.status();
-                while let Some(status) = status.next().await {
-                    if status.is_connected() {
-                        // this.update(cx, |this, cx| {
-                        //     // TODO here we'd change account status
-                        // })?;
-                        break;
+                    // Establish TCP connection
+                    let stream = tokio::net::TcpStream::connect((host, port))
+                        .await
+                        .context("Failed to connect to TCP stream")?;
+
+                    let result =
+                        async_tungstenite::tokio::client_async_tls_with_connector_and_config(
+                            req,
+                            stream,
+                            Some(Arc::new(http_client_tls::tls_config()).into()),
+                            None,
+                        )
+                        .await;
+
+                    match &result {
+                        Ok(_) => log::info!("WebSocket connection successful"),
+                        Err(e) => log::error!("WebSocket connection failed: {}", e),
                     }
-                }
+                    result.context("Failed to connect to NinetyFive server")
+                })?
+                .await??;
 
+                log::info!("WebSocket connection established successfully");
+
+                let (ws_sink, ws_stream) = ws_stream.split();
+
+                log::info!("Starting message handlers");
                 let outgoing_future = Self::handle_outgoing_messages(outgoing_rx, ws_sink);
                 let incoming_future = Self::handle_incoming_messages(this, ws_stream, cx);
 
@@ -271,8 +295,7 @@ impl NinetyFiveAgent {
             next_state_id: NinetyFiveCompletionStateId::default(),
             states: BTreeMap::default(),
             outgoing_tx,
-            _handle_outgoing_messages: handle_connection,
-            _handle_incoming_messages: Task::ready(Ok(())),
+            _connection_task: handle_connection,
             client,
             close_tx: Some(close_tx),
         })
@@ -281,13 +304,9 @@ impl NinetyFiveAgent {
     // Only in charge of sending messages to the server
     async fn handle_outgoing_messages(
         mut outgoing: mpsc::UnboundedReceiver<WebSocketMessage>,
-        mut ws_sink: futures::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        mut ws_sink: impl SinkExt<Message, Error = async_tungstenite::tungstenite::Error> + Unpin,
     ) -> Result<()> {
+        log::info!("outgoing!!!");
         while let Some(message) = outgoing.next().await {
             let json = serde_json::to_string(&message)?;
             ws_sink.send(Message::text(json)).await?;
@@ -297,21 +316,17 @@ impl NinetyFiveAgent {
 
     async fn handle_incoming_messages(
         this: WeakEntity<NinetyFive>,
-        mut ws_stream: futures::stream::SplitStream<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-        >,
+        mut ws_stream: impl StreamExt<Item = Result<Message, async_tungstenite::tungstenite::Error>>
+        + Unpin,
         cx: &mut AsyncApp,
     ) -> Result<()> {
+        log::info!("incoming!!!");
         while let Some(msg) = ws_stream.next().await {
             let msg = msg.context("WebSocket error")?;
 
             match msg {
                 Message::Text(text) => {
-                    let message = serde_json::from_str::<NinetyFiveMessage>(&text)
-                        .with_context(|| format!("Failed to deserialize message: {:?}", text));
-
+                    let message = serde_json::from_str::<NinetyFiveMessage>(&text);
                     match message {
                         Ok(message) => {
                             this.update(cx, |this, _cx| {
@@ -323,7 +338,7 @@ impl NinetyFiveAgent {
                             .await?;
                         }
                         Err(e) => {
-                            log::warn!("Failed to deserialize message: {}", e);
+                            log::warn!("Failed to deserialize message '{}': {}", text, e);
                         }
                     }
                 }
