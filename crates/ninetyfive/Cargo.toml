@@ -12,6 +12,7 @@ path = "src/ninetyfive.rs"
 anyhow.workspace = true
 async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 client.workspace = true
+chrono.workspace = true
 edit_prediction.workspace = true
 futures.workspace = true
 gpui.workspace = true

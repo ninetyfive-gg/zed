@@ -3,12 +3,13 @@ use anyhow::Result;
 use async_tungstenite::{
     tokio::client_async_tls_with_connector_and_config, tungstenite::Message, WebSocketStream,
 };
+use chrono::{DateTime, Duration, Utc};
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
-use gpui::{App, Context, Entity};
+use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use http_client_tls;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, ToOffset};
@@ -21,6 +22,7 @@ use std::{
 use tokio::{
     net::TcpStream,
     sync::{mpsc, Mutex},
+    time::sleep,
 };
 
 const NINETYFIVE_API_URL: &str = "wss://api.ninetyfive.gg";
@@ -44,6 +46,7 @@ impl CurrentCompletion {
 pub struct NinetyFiveCompletionProvider {
     ninetyfive: Entity<NinetyFive>,
     current_completion: Option<CurrentCompletion>,
+    pending_refresh: Option<Task<Result<()>>>,
 }
 
 static WEBSOCKET_CLIENT: OnceLock<Arc<WebSocketClient>> = OnceLock::new();
@@ -191,6 +194,8 @@ impl WebSocketClient {
                         while let Some(msg) = stream.next().await {
                             match msg {
                                 Ok(Message::Text(text)) => {
+                                    let now = Utc::now();
+                                    println!("Response {}", now);
                                     log::info!("NinetyFive: Received: {}", text);
 
                                     if let Ok(response) =
@@ -316,6 +321,8 @@ impl WebSocketClient {
                 request_id: request_id.clone(),
             })?;
 
+            let now = Utc::now();
+            println!("Request{}", now);
             log::info!(
                 "NinetyFive: Queued completion request {} at pos {}",
                 request_id,
@@ -355,6 +362,7 @@ impl NinetyFiveCompletionProvider {
         Self {
             ninetyfive,
             current_completion: None,
+            pending_refresh: None,
         }
     }
 }
@@ -380,19 +388,125 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
     }
 
     fn is_refreshing(&self) -> bool {
-        false
+        self.pending_refresh.is_some()
     }
 
     fn refresh(
         &mut self,
         _project: Option<Entity<Project>>,
-        _buffer_handle: Entity<Buffer>,
-        _cursor_position: Anchor,
+        buffer_handle: Entity<Buffer>,
+        cursor_position: Anchor,
         debounce: bool,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         log::info!("NinetyFive: Refresh called (debounce: {})", debounce);
-        self.current_completion = None;
+
+        // Get repo name (fallback to "unknown")
+        let buffer = buffer_handle.read(cx);
+        let repo = buffer
+            .file()
+            .and_then(|file| {
+                file.path()
+                    .ancestors()
+                    .find(|p| p.join(".git").exists())
+                    .and_then(|p| p.file_name())
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Get file information for the completion request
+        let (file_path, file_content) = if let Some(file) = buffer.file() {
+            let path = file.path().to_string_lossy().to_string();
+            let content = buffer.text();
+            (Some(path), Some(content))
+        } else {
+            (None, None)
+        };
+
+        let cursor_offset = cursor_position.to_offset(&buffer);
+        let client = WebSocketClient::get_singleton(cx);
+        let client_clone = client.clone();
+
+        // Send the completion request first using Tokio::spawn
+        let task = Tokio::spawn(cx, async move {
+            if debounce {
+                sleep(std::time::Duration::from_millis(15)).await;
+            }
+
+            // Send the completion request
+            if let Err(e) = client_clone
+                .send_delta_completion_request(
+                    cursor_offset,
+                    &repo,
+                    file_path.as_deref(),
+                    file_content.as_deref(),
+                )
+                .await
+            {
+                log::error!("NinetyFive: Completion request failed: {}", e);
+                return;
+            }
+
+            log::info!("NinetyFive: Completion request sent successfully");
+        });
+
+        // Now set the pending refresh task to wait for completion
+        self.pending_refresh = Some(cx.spawn(async move |this, cx| {
+            // Use Tokio::spawn for the polling loop that needs sleep
+            let polling_task = Tokio::spawn(cx, async move {
+                // Wait for completion to be ready by polling the client
+                let mut attempts = 0;
+                let max_attempts = 100; // 5 seconds max wait time
+
+                loop {
+                    let completion_text = client.get_current_completion().await;
+
+                    if !completion_text.is_empty() {
+                        log::info!("NinetyFive: Completion ready: '{}'", completion_text);
+                        return true; // Completion found
+                    }
+
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        log::warn!("NinetyFive: Timeout waiting for completion");
+                        return false; // Timeout
+                    }
+
+                    sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+
+            // Wait for the polling task to complete
+            let completion_ready = match polling_task {
+                Ok(task) => match task.await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::error!("NinetyFive: Polling task failed: {}", e);
+                        false
+                    }
+                },
+                Err(e) => {
+                    log::error!("NinetyFive: Failed to spawn polling task: {}", e);
+                    false
+                }
+            };
+
+            // Update the provider state and notify
+            this.update(cx, |this, cx| {
+                this.pending_refresh = None;
+                cx.notify();
+            })?;
+
+            if completion_ready {
+                log::info!("NinetyFive: Completion polling completed successfully");
+            } else {
+                log::warn!("NinetyFive: Completion polling timed out");
+            }
+
+            Ok(())
+        }));
+
+        task.detach();
     }
 
     fn cycle(
@@ -407,11 +521,13 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
 
     fn accept(&mut self, _cx: &mut Context<Self>) {
         log::debug!("NinetyFive: Completion accepted");
+        self.pending_refresh = None;
         self.current_completion = None;
     }
 
     fn discard(&mut self, _cx: &mut Context<Self>) {
         log::debug!("NinetyFive: Completion discarded");
+        self.pending_refresh = None;
         self.current_completion = None;
     }
 
@@ -421,7 +537,8 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         cursor_position: language::Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
-        log::info!("NinetyFive: Suggest called");
+        let now = Utc::now();
+        log::info!("NinetyFive: Suggest called {}", now);
 
         // Get current buffer snapshot
         let buffer_snapshot = buffer.read(cx);
@@ -431,11 +548,16 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         // Check if we have a current completion and if it's still valid
         if let Some(current_completion) = &self.current_completion {
             // Check if the completion is still valid for the current position and buffer state
-            if current_completion.snapshot.version() == snapshot.version() 
-                && current_completion.cursor_offset == cursor_offset {
+            if current_completion.snapshot.version() == snapshot.version()
+                && current_completion.cursor_offset == cursor_offset
+            {
                 if let Some(edits) = current_completion.interpolate(&snapshot) {
                     if !edits.is_empty() {
-                        log::info!("NinetyFive: Reusing existing completion {} {}", current_completion.cursor_offset, cursor_offset);
+                        log::info!(
+                            "NinetyFive: Reusing existing completion {} {}",
+                            current_completion.cursor_offset,
+                            cursor_offset
+                        );
                         return Some(EditPrediction {
                             id: None,
                             edits,
@@ -445,15 +567,19 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
                 }
             } else {
                 // Buffer has changed or cursor moved, invalidate current completion
-                log::info!("NinetyFive: Buffer changed or cursor moved, invalidating current completion");
+                log::info!(
+                    "NinetyFive: Buffer changed or cursor moved, invalidating current completion"
+                );
                 self.current_completion = None;
             }
         }
 
         // Check if we have any completion text from the shared state
         let client = WebSocketClient::get_singleton(cx);
-        let (completion_text, completion_offset) = if let (Ok(completion_guard), Ok(offset_guard)) = 
-            (client.current_completion_text.try_lock(), client.current_completion_offset.try_lock()) {
+        let (completion_text, completion_offset) = if let (Ok(completion_guard), Ok(offset_guard)) = (
+            client.current_completion_text.try_lock(),
+            client.current_completion_offset.try_lock(),
+        ) {
             (completion_guard.clone(), *offset_guard)
         } else {
             (String::new(), None)
@@ -463,71 +589,43 @@ impl EditPredictionProvider for NinetyFiveCompletionProvider {
         if !completion_text.is_empty() && self.current_completion.is_none() {
             // Only use the completion if it's for the current cursor position
             if completion_offset == Some(cursor_offset) {
-                log::info!("NinetyFive: Found completion text for current position: '{}'", completion_text);
-                
+                log::info!(
+                    "NinetyFive: Found completion text for current position: '{}'",
+                    completion_text
+                );
+
                 let position = cursor_position.bias_right(&buffer_snapshot);
-                let edits: Arc<[(Range<Anchor>, String)]> = Arc::from([(position..position, completion_text.clone())]);
-                
+                let edits: Arc<[(Range<Anchor>, String)]> =
+                    Arc::from([(position..position, completion_text.clone())]);
+
                 // Create edit preview using the buffer's preview_edits method
                 let edit_preview_task = buffer_snapshot.preview_edits(edits.clone(), cx);
                 let edit_preview = cx.background_executor().block(edit_preview_task);
-                
-                self.current_completion = Some(CurrentCompletion {
+
+                let current_completion = CurrentCompletion {
                     snapshot: snapshot.clone(),
                     edits: edits.clone(),
                     edit_preview,
                     cursor_offset,
-                });
+                };
 
-                return Some(EditPrediction {
-                    id: None,
-                    edits: vec![(position..position, completion_text)],
-                    edit_preview: None,
-                });
+                self.current_completion = Some(current_completion.clone());
+
+                log::info!("should show?");
+                if let Some(edits) = current_completion.interpolate(&snapshot) {
+                    if !edits.is_empty() {
+                        log::info!("madaskdfjasdfk");
+                        return Some(EditPrediction {
+                            id: None,
+                            edits,
+                            edit_preview: Some(current_completion.edit_preview.clone()),
+                        });
+                    }
+                }
             } else {
                 log::info!("NinetyFive: Ignoring completion text for different position: expected {}, got {:?}", cursor_offset, completion_offset);
             }
         }
-
-        log::info!("Ninetyfive: about to request a new one");
-        // If no current completion or completion text, send a new completion request
-        // Get repo name (fallback to "unknown")
-        let repo = buffer_snapshot
-            .file()
-            .and_then(|file| {
-                file.path()
-                    .ancestors()
-                    .find(|p| p.join(".git").exists())
-                    .and_then(|p| p.file_name())
-                    .map(|name| name.to_string_lossy().to_string())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Get file information for the completion request
-        let (file_path, file_content) = if let Some(file) = buffer_snapshot.file() {
-            let path = file.path().to_string_lossy().to_string();
-            let content = buffer_snapshot.text();
-            (Some(path), Some(content))
-        } else {
-            (None, None)
-        };
-
-        // Send completion request
-        let client_clone = client.clone();
-        let task = Tokio::spawn(cx, async move {
-            if let Err(e) = client_clone
-                .send_delta_completion_request(
-                    cursor_offset,
-                    &repo,
-                    file_path.as_deref(),
-                    file_content.as_deref(),
-                )
-                .await
-            {
-                log::error!("NinetyFive: Completion request failed: {}", e);
-            }
-        });
-        task.detach();
 
         // No completion available yet
         None
